@@ -52,7 +52,6 @@ use futures_lite::pin;
 use latch::{Latch, LatchState};
 use log::warn;
 pub use placement::{CpuSet, Placement, PoolPlacement};
-use scoped_tls::scoped_thread_local;
 use std::{
     cell::RefCell,
     collections::{hash_map::Entry, BinaryHeap},
@@ -87,18 +86,32 @@ pub(crate) const DEFAULT_RING_SUBMISSION_DEPTH: usize = 128;
 /// the second type parameter.
 type Result<T> = crate::Result<T, ()>;
 
-scoped_thread_local!(static LOCAL_EX: LocalExecutor);
+#[cfg(feature = "native-tls")]
+#[thread_local]
+static mut LOCAL_EX: *const LocalExecutor = std::ptr::null();
+
+#[cfg(not(feature = "native-tls"))]
+scoped_tls::scoped_thread_local!(static LOCAL_EX: LocalExecutor);
 
 /// Returns a proxy struct to the [`LocalExecutor`]
+#[inline(always)]
 pub fn executor() -> ExecutorProxy {
     ExecutorProxy {}
 }
 
 pub(crate) fn executor_id() -> Option<usize> {
-    if LOCAL_EX.is_set() {
-        Some(LOCAL_EX.with(|ex| ex.id))
-    } else {
-        None
+    #[cfg(not(feature = "native-tls"))]
+    {
+        if LOCAL_EX.is_set() {
+            Some(LOCAL_EX.with(|ex| ex.id))
+        } else {
+            None
+        }
+    }
+
+    #[cfg(feature = "native-tls")]
+    unsafe {
+        LOCAL_EX.as_ref().map(|ex| ex.id)
     }
 }
 
@@ -634,7 +647,7 @@ impl LocalExecutorBuilder {
     ///
     /// The indirection of `fut_gen()` here (instead of taking a `Future`)
     /// allows for futures that may not be `Send`-able once started. As this
-    /// executor is thread- it can guarantee that the futures will not
+    /// executor is thread-local it can guarantee that the futures will not
     /// be Sent once started.
     ///
     /// # Panics
@@ -1051,10 +1064,21 @@ impl<T> PoolThreadHandles<T> {
 }
 
 pub(crate) fn maybe_activate(tq: Rc<RefCell<TaskQueue>>) {
+    #[cfg(not(feature = "native-tls"))]
     LOCAL_EX.with(|local_ex| {
         let mut queues = local_ex.queues.borrow_mut();
-        queues.maybe_activate(tq)
-    })
+        queues.maybe_activate(tq);
+    });
+
+    #[cfg(feature = "native-tls")]
+    unsafe {
+        let mut queues = LOCAL_EX
+            .as_ref()
+            .expect("this thread doesn't have a LocalExecutor running")
+            .queues
+            .borrow_mut();
+        queues.maybe_activate(tq);
+    };
 }
 
 pub struct LocalExecutorConfig {
@@ -1426,18 +1450,15 @@ impl LocalExecutor {
     /// assert_eq!(res, 6);
     /// ```
     pub fn run<T>(&self, future: impl Future<Output = T>) -> T {
-        // this waker is never exposed in the public interface and is only used to check
-        // whether the task's `JoinHandle` is `Ready`
-        let waker = dummy_waker();
-        let cx = &mut Context::from_waker(&waker);
+        let run = |this: &Self| {
+            // this waker is never exposed in the public interface and is only used to check
+            // whether the task's `JoinHandle` is `Ready`
+            let waker = dummy_waker();
+            let cx = &mut Context::from_waker(&waker);
 
-        let spin_before_park = self.spin_before_park().unwrap_or_default();
-        if LOCAL_EX.is_set() {
-            panic!("There is already an Executor running in this thread");
-        }
+            let spin_before_park = self.spin_before_park().unwrap_or_default();
 
-        LOCAL_EX.set(self, || {
-            let future = self
+            let future = this
                 .spawn_into(async move { future.await }, TaskQueueHandle::default())
                 .unwrap()
                 .detach();
@@ -1449,7 +1470,7 @@ impl LocalExecutor {
                     // can't be canceled, and join handle is None only upon
                     // cancellation or panic. So in case of panic this just propagates
                     let cur_time = Instant::now();
-                    self.queues.borrow_mut().stats.total_runtime += cur_time - pre_time;
+                    this.queues.borrow_mut().stats.total_runtime += cur_time - pre_time;
                     break t.unwrap();
                 }
 
@@ -1458,16 +1479,16 @@ impl LocalExecutor {
                 // requests that are latency sensitive we want them out of the
                 // ring ASAP (before we run the task queues). We will also use
                 // the opportunity to install the timer.
-                self.parker
-                    .poll_io(|| Some(self.preempt_timer_duration()))
+                this.parker
+                    .poll_io(|| Some(this.preempt_timer_duration()))
                     .expect("Failed to poll io! This is actually pretty bad!");
 
                 // run user code
-                let run = self.run_task_queues();
+                let run = this.run_task_queues();
 
                 // account for runtime and poll/sleep if possible
                 let cur_time = Instant::now();
-                self.queues.borrow_mut().stats.total_runtime += cur_time - pre_time;
+                this.queues.borrow_mut().stats.total_runtime += cur_time - pre_time;
                 pre_time = cur_time;
                 if !run {
                     if let Poll::Ready(t) = future.as_mut().poll(cx) {
@@ -1477,9 +1498,9 @@ impl LocalExecutor {
                         // future is probably the one setting up the task queues and etc.
                         break t.unwrap();
                     } else {
-                        while !self.reactor.spin_poll_io().unwrap() {
+                        while !this.reactor.spin_poll_io().unwrap() {
                             if pre_time.elapsed() > spin_before_park {
-                                self.parker
+                                this.parker
                                     .park()
                                     .expect("Failed to park! This is actually pretty bad!");
                                 break;
@@ -1490,7 +1511,28 @@ impl LocalExecutor {
                     }
                 }
             }
-        })
+        };
+
+        #[cfg(not(feature = "native-tls"))]
+        {
+            assert!(
+                !LOCAL_EX.is_set(),
+                "There is already an LocalExecutor running on this thread"
+            );
+            LOCAL_EX.set(self, || run(self))
+        }
+
+        #[cfg(feature = "native-tls")]
+        unsafe {
+            assert!(
+                LOCAL_EX.is_null(),
+                "There is already an LocalExecutor running on this thread"
+            );
+
+            defer!(LOCAL_EX = std::ptr::null());
+            LOCAL_EX = self as *const Self;
+            run(self)
+        }
     }
 }
 
@@ -1858,7 +1900,7 @@ impl<'a, T> Future for ScopedTask<'a, T> {
 /// and should be preferred over unconditional yielding methods like
 /// [`ExecutorProxy::yield_now`] and
 /// [`ExecutorProxy::yield_task_queue_now`].
-#[inline]
+#[inline(always)]
 pub async fn yield_if_needed() {
     executor().yield_if_needed().await
 }
@@ -2042,29 +2084,6 @@ pub unsafe fn spawn_scoped_local_into<'a, T>(
 pub struct ExecutorProxy {}
 
 impl ExecutorProxy {
-    async fn cond_yield<F>(cond: F)
-    where
-        F: FnOnce(&LocalExecutor) -> bool,
-    {
-        let need_yield = if LOCAL_EX.is_set() {
-            LOCAL_EX.with(|local_ex| {
-                if cond(local_ex) {
-                    local_ex.mark_me_for_yield();
-                    true
-                } else {
-                    false
-                }
-            })
-        } else {
-            // We are not in a glommio context
-            false
-        };
-
-        if need_yield {
-            futures_lite::future::yield_now().await;
-        }
-    }
-
     /// Checks if this task has run for too long and need to be preempted. This
     /// is useful for situations where we can't call .await, for instance,
     /// if a [`RefMut`] is held. If this tests true, then the user is
@@ -2091,30 +2110,17 @@ impl ExecutorProxy {
     ///
     /// [`RefMut`]: https://doc.rust-lang.org/std/cell/struct.RefMut.html
     #[inline(always)]
-    // FIXME: This is a bit less efficient than it needs, because the scoped thread
-    // local key does lazy initialization. Every time we call into this, we are
-    // paying to test if this is initialized. This is what I got from objdump:
-    //
-    // 0:    50                      push   %rax
-    // 1:    ff 15 00 00 00 00       callq  *0x0(%rip)
-    // 7:    48 85 c0                test   %rax,%rax
-    // a:    74 17                   je     23  <== will call into the
-    // initialization routine c:    48 8b 88 38 03 00 00    mov
-    // 0x338(%rax),%rcx <== address of the head 13:   48 8b 80 40 03 00 00
-    // mov    0x340(%rax),%rax <== address of the tail 1a:   8b 00
-    // mov    (%rax),%eax 1c:   3b 01                   cmp    (%rcx),%eax <==
-    // need preempt 1e:   0f 95 c0                setne  %al
-    // 21:   59                      pop    %rcx
-    // 22:   c3                      retq
-    // 23    <== initialization stuff
-    //
-    // Rust has a thread local feature that is under experimental so we can maybe
-    // switch to that someday.
-    //
-    // We will prefer to use the stable compiler and pay that unfortunate price for
-    // now.
     pub fn need_preempt(&self) -> bool {
-        LOCAL_EX.with(|local_ex| local_ex.need_preempt())
+        #[cfg(not(feature = "native-tls"))]
+        return LOCAL_EX.with(|local_ex| local_ex.need_preempt());
+
+        #[cfg(feature = "native-tls")]
+        return unsafe {
+            LOCAL_EX
+                .as_ref()
+                .map(|ex| ex.need_preempt())
+                .unwrap_or_default()
+        };
     }
 
     /// Conditionally yields the current task queue. The scheduler may then
@@ -2132,9 +2138,36 @@ impl ExecutorProxy {
     /// and should be preferred over unconditional yielding methods like
     /// [`ExecutorProxy::yield_now`] and
     /// [`ExecutorProxy::yield_task_queue_now`].
-    #[inline]
+    #[inline(always)]
     pub async fn yield_if_needed(&self) {
-        Self::cond_yield(|local_ex| local_ex.need_preempt()).await;
+        #[cfg(not(feature = "native-tls"))]
+        {
+            let need_yield = if LOCAL_EX.is_set() {
+                LOCAL_EX.with(|local_ex| {
+                    if local_ex.need_preempt() {
+                        local_ex.mark_me_for_yield();
+                        true
+                    } else {
+                        false
+                    }
+                })
+            } else {
+                // We are not in a glommio context
+                false
+            };
+
+            if need_yield {
+                futures_lite::future::yield_now().await;
+            }
+        }
+
+        #[cfg(feature = "native-tls")]
+        unsafe {
+            if self.need_preempt() {
+                (*LOCAL_EX).mark_me_for_yield();
+                futures_lite::future::yield_now().await;
+            }
+        }
     }
 
     /// Unconditionally yields the current task and forces the scheduler
@@ -2143,6 +2176,7 @@ impl ExecutorProxy {
     ///
     /// Unless you know you need to yield right now, using
     /// [`ExecutorProxy::yield_if_needed`] instead is the better choice.
+    #[inline(always)]
     pub async fn yield_now(&self) {
         futures_lite::future::yield_now().await
     }
@@ -2153,13 +2187,39 @@ impl ExecutorProxy {
     ///
     /// Unless you know you need to yield right now, using
     /// [`ExecutorProxy::yield_if_needed`] instead is the better choice.
+    #[inline(always)]
     pub async fn yield_task_queue_now(&self) {
-        Self::cond_yield(|_| true).await
+        #[cfg(not(feature = "native-tls"))]
+        {
+            if LOCAL_EX.is_set() {
+                LOCAL_EX.with(|local_ex| {
+                    local_ex.mark_me_for_yield();
+                })
+            }
+            futures_lite::future::yield_now().await;
+        }
+
+        #[cfg(feature = "native-tls")]
+        {
+            if let Some(local_ex) = unsafe { LOCAL_EX.as_ref() } {
+                local_ex.mark_me_for_yield();
+            }
+            futures_lite::future::yield_now().await;
+        }
     }
 
-    #[inline]
+    #[inline(always)]
     pub(crate) fn reactor(&self) -> Rc<reactor::Reactor> {
-        LOCAL_EX.with(|local_ex| local_ex.get_reactor())
+        #[cfg(not(feature = "native-tls"))]
+        return LOCAL_EX.with(|local_ex| local_ex.get_reactor());
+
+        #[cfg(feature = "native-tls")]
+        return unsafe {
+            LOCAL_EX
+                .as_ref()
+                .expect("this thread doesn't have a LocalExecutor running")
+                .get_reactor()
+        };
     }
 
     /// Returns the id of the current executor
@@ -2180,7 +2240,16 @@ impl ExecutorProxy {
     /// });
     /// ```
     pub fn id(&self) -> usize {
-        LOCAL_EX.with(|local_ex| local_ex.id())
+        #[cfg(not(feature = "native-tls"))]
+        return LOCAL_EX.with(|local_ex| local_ex.id());
+
+        #[cfg(feature = "native-tls")]
+        return unsafe {
+            LOCAL_EX
+                .as_ref()
+                .expect("this thread doesn't have a LocalExecutor running")
+                .id()
+        };
     }
 
     /// Creates a new task queue, with a given latency hint and the provided
@@ -2224,7 +2293,16 @@ impl ExecutorProxy {
         latency: Latency,
         name: &str,
     ) -> TaskQueueHandle {
-        LOCAL_EX.with(|local_ex| local_ex.create_task_queue(shares, latency, name))
+        #[cfg(not(feature = "native-tls"))]
+        return LOCAL_EX.with(|local_ex| local_ex.create_task_queue(shares, latency, name));
+
+        #[cfg(feature = "native-tls")]
+        return unsafe {
+            LOCAL_EX
+                .as_ref()
+                .expect("this thread doesn't have a LocalExecutor running")
+                .create_task_queue(shares, latency, name)
+        };
     }
 
     /// Returns the [`TaskQueueHandle`] that represents the TaskQueue currently
@@ -2265,7 +2343,16 @@ impl ExecutorProxy {
     /// ex.join().unwrap();
     /// ```
     pub fn current_task_queue(&self) -> TaskQueueHandle {
-        LOCAL_EX.with(|local_ex| local_ex.current_task_queue())
+        #[cfg(not(feature = "native-tls"))]
+        return LOCAL_EX.with(|local_ex| local_ex.current_task_queue());
+
+        #[cfg(feature = "native-tls")]
+        return unsafe {
+            LOCAL_EX
+                .as_ref()
+                .expect("this thread doesn't have a LocalExecutor running")
+                .current_task_queue()
+        };
     }
 
     /// Returns a [`Result`] with its `Ok` value wrapping a [`TaskQueueStats`]
@@ -2298,10 +2385,22 @@ impl ExecutorProxy {
     /// [`QueueErrorKind`]: crate::error::QueueErrorKind
     /// [`Result`]: https://doc.rust-lang.org/std/result/enum.Result.html
     pub fn task_queue_stats(&self, handle: TaskQueueHandle) -> Result<TaskQueueStats> {
-        LOCAL_EX.with(|local_ex| match local_ex.get_queue(&handle) {
+        #[cfg(not(feature = "native-tls"))]
+        return LOCAL_EX.with(|local_ex| match local_ex.get_queue(&handle) {
             Some(x) => Ok(x.borrow_mut().stats.take()),
             None => Err(GlommioError::queue_not_found(handle.index)),
-        })
+        });
+
+        #[cfg(feature = "native-tls")]
+        return match unsafe {
+            LOCAL_EX
+                .as_ref()
+                .expect("this thread doesn't have a LocalExecutor running")
+                .get_queue(&handle)
+        } {
+            Some(x) => Ok(x.borrow_mut().stats.take()),
+            None => Err(GlommioError::queue_not_found(handle.index)),
+        };
     }
 
     /// Returns a collection of [`TaskQueueStats`] with information about all
@@ -2340,15 +2439,31 @@ impl ExecutorProxy {
     where
         V: Extend<TaskQueueStats>,
     {
+        #[cfg(not(feature = "native-tls"))]
         LOCAL_EX.with(|local_ex| {
-            let tq = local_ex.queues.borrow();
             output.extend(
-                tq.available_executors
+                local_ex
+                    .queues
+                    .borrow()
+                    .available_executors
                     .values()
                     .map(|x| x.borrow_mut().stats.take()),
             );
-            output
-        })
+        });
+
+        #[cfg(feature = "native-tls")]
+        output.extend(unsafe {
+            LOCAL_EX
+                .as_ref()
+                .expect("this thread doesn't have a LocalExecutor running")
+                .queues
+                .borrow()
+                .available_executors
+                .values()
+                .map(|x| x.borrow_mut().stats.take())
+        });
+
+        output
     }
 
     /// Returns a [`ExecutorStats`] struct with information about this Executor
@@ -2372,7 +2487,18 @@ impl ExecutorProxy {
     ///
     /// [`ExecutorStats`]: struct.ExecutorStats.html
     pub fn executor_stats(&self) -> ExecutorStats {
-        LOCAL_EX.with(|local_ex| std::mem::take(&mut local_ex.queues.borrow_mut().stats))
+        #[cfg(not(feature = "native-tls"))]
+        return LOCAL_EX.with(|local_ex| std::mem::take(&mut local_ex.queues.borrow_mut().stats));
+
+        #[cfg(feature = "native-tls")]
+        return std::mem::take(unsafe {
+            &mut LOCAL_EX
+                .as_ref()
+                .expect("this thread doesn't have a LocalExecutor running")
+                .queues
+                .borrow_mut()
+                .stats
+        });
     }
 
     /// Returns an [`IoStats`] struct with information about IO performed by
@@ -2394,7 +2520,17 @@ impl ExecutorProxy {
     ///
     /// [`IoStats`]: crate::IoStats
     pub fn io_stats(&self) -> IoStats {
-        LOCAL_EX.with(|local_ex| local_ex.get_reactor().io_stats())
+        #[cfg(not(feature = "native-tls"))]
+        return LOCAL_EX.with(|local_ex| local_ex.get_reactor().io_stats());
+
+        #[cfg(feature = "native-tls")]
+        return unsafe {
+            LOCAL_EX
+                .as_ref()
+                .expect("this thread doesn't have a LocalExecutor running")
+                .get_reactor()
+                .io_stats()
+        };
     }
 
     /// Returns an [`IoStats`] struct with information about IO performed from
@@ -2424,12 +2560,25 @@ impl ExecutorProxy {
     ///
     /// [`IoStats`]: crate::IoStats
     pub fn task_queue_io_stats(&self, handle: TaskQueueHandle) -> Result<IoStats> {
-        LOCAL_EX.with(
-            |local_ex| match local_ex.get_reactor().task_queue_io_stats(&handle) {
+        #[cfg(not(feature = "native-tls"))]
+        return LOCAL_EX.with(|local_ex| {
+            match local_ex.get_reactor().task_queue_io_stats(&handle) {
                 Some(x) => Ok(x),
                 None => Err(GlommioError::queue_not_found(handle.index)),
-            },
-        )
+            }
+        });
+
+        #[cfg(feature = "native-tls")]
+        return match unsafe {
+            LOCAL_EX
+                .as_ref()
+                .expect("this thread doesn't have a LocalExecutor running")
+                .get_reactor()
+                .task_queue_io_stats(&handle)
+        } {
+            Some(x) => Ok(x),
+            None => Err(GlommioError::queue_not_found(handle.index)),
+        };
     }
 
     /// Spawns a task onto the current single-threaded executor.
@@ -2458,7 +2607,16 @@ impl ExecutorProxy {
     where
         T: 'static,
     {
-        LOCAL_EX.with(|local_ex| Task::<T>(local_ex.spawn(future)))
+        #[cfg(not(feature = "native-tls"))]
+        return LOCAL_EX.with(|local_ex| Task::<T>(local_ex.spawn(future)));
+
+        #[cfg(feature = "native-tls")]
+        return Task::<T>(unsafe {
+            LOCAL_EX
+                .as_ref()
+                .expect("this thread doesn't have a LocalExecutor running")
+                .spawn(future)
+        });
     }
 
     /// Spawns a task onto the current single-threaded executor, in a particular
@@ -2498,7 +2656,17 @@ impl ExecutorProxy {
     where
         T: 'static,
     {
-        LOCAL_EX.with(|local_ex| local_ex.spawn_into(future, handle).map(Task::<T>))
+        #[cfg(not(feature = "native-tls"))]
+        return LOCAL_EX.with(|local_ex| local_ex.spawn_into(future, handle).map(Task::<T>));
+
+        #[cfg(feature = "native-tls")]
+        return unsafe {
+            LOCAL_EX
+                .as_ref()
+                .expect("this thread doesn't have a LocalExecutor running")
+                .spawn_into(future, handle)
+        }
+        .map(Task::<T>);
     }
 
     /// Spawns a task onto the current single-threaded executor.
@@ -2529,7 +2697,17 @@ impl ExecutorProxy {
         &self,
         future: impl Future<Output = T> + 'a,
     ) -> ScopedTask<'a, T> {
-        LOCAL_EX.with(|local_ex| ScopedTask::<'a, T>(local_ex.spawn(future), PhantomData))
+        #[cfg(not(feature = "native-tls"))]
+        return LOCAL_EX.with(|local_ex| ScopedTask::<'a, T>(local_ex.spawn(future), PhantomData));
+
+        #[cfg(feature = "native-tls")]
+        return ScopedTask::<'a, T>(
+            LOCAL_EX
+                .as_ref()
+                .expect("this thread doesn't have a LocalExecutor running")
+                .spawn(future),
+            PhantomData,
+        );
     }
 
     /// Spawns a task onto the current single-threaded executor, in a particular
@@ -2570,11 +2748,19 @@ impl ExecutorProxy {
         future: impl Future<Output = T> + 'a,
         handle: TaskQueueHandle,
     ) -> Result<ScopedTask<'a, T>> {
-        LOCAL_EX.with(|local_ex| {
+        #[cfg(not(feature = "native-tls"))]
+        return LOCAL_EX.with(|local_ex| {
             local_ex
                 .spawn_into(future, handle)
                 .map(|x| ScopedTask::<'a, T>(x, PhantomData))
-        })
+        });
+
+        #[cfg(feature = "native-tls")]
+        return LOCAL_EX
+            .as_ref()
+            .expect("this thread doesn't have a LocalExecutor running")
+            .spawn_into(future, handle)
+            .map(|x| ScopedTask::<'a, T>(x, PhantomData));
     }
 
     /// Spawns a blocking task into a background thread where blocking is
@@ -2619,10 +2805,22 @@ impl ExecutorProxy {
     {
         let result = Arc::new(Mutex::new(MaybeUninit::<R>::uninit()));
         let f_inner = enclose::enclose!((result) move || {result.lock().unwrap().write(func());});
-        let source =
+
+        #[cfg(not(feature = "native-tls"))]
+        let waiter =
             LOCAL_EX.with(move |local_ex| local_ex.reactor.run_blocking(Box::new(f_inner)));
 
+        #[cfg(feature = "native-tls")]
+        let waiter = unsafe {
+            LOCAL_EX
+                .as_ref()
+                .expect("this thread doesn't have a LocalExecutor running")
+                .reactor
+                .run_blocking(Box::new(f_inner))
+        };
+
         async move {
+            let source = waiter.await;
             assert!(source.collect_rw().await.is_ok());
             unsafe {
                 let res_arc = Arc::try_unwrap(result).expect("leak");
@@ -2955,17 +3153,14 @@ mod test {
         Duration::from_secs(v.tv_sec as u64) + Duration::from_micros(v.tv_usec as u64)
     }
 
-    fn getrusage() -> libc::rusage {
+    fn getrusage() -> Duration {
         let mut s0 = MaybeUninit::<libc::rusage>::uninit();
         let err = unsafe { libc::getrusage(libc::RUSAGE_THREAD, s0.as_mut_ptr()) };
         if err != 0 {
             panic!("getrusage error = {}", err);
         }
-        unsafe { s0.assume_init() }
-    }
-
-    fn getrusage_utime() -> Duration {
-        from_timeval(getrusage().ru_utime)
+        let usage = unsafe { s0.assume_init() };
+        from_timeval(usage.ru_utime) + from_timeval(usage.ru_stime)
     }
 
     #[test]
@@ -2976,7 +3171,7 @@ mod test {
             Latency::Matters(Duration::from_millis(10)),
             "my_tq",
         );
-        let start = getrusage_utime();
+        let start = getrusage();
         ex.run(async {
             crate::spawn_local_into(
                 async { timer::sleep(Duration::from_secs(1)).await },
@@ -2987,8 +3182,8 @@ mod test {
         });
 
         assert!(
-            getrusage_utime() - start < Duration::from_millis(2),
-            "expected user time on LE is less than 2 millisecond"
+            getrusage() - start < Duration::from_millis(10),
+            "expected user time on LE is less than 10 millisecond"
         );
     }
 
@@ -2996,30 +3191,34 @@ mod test {
     fn test_spin() {
         let dur = Duration::from_secs(1);
         let ex0 = LocalExecutorBuilder::default().make().unwrap();
-        let ex0_ru_start = getrusage_utime();
-        ex0.run(async { timer::sleep(dur).await });
-        let ex0_ru_finish = getrusage_utime();
+        ex0.run(async {
+            let ex0_ru_start = getrusage();
+            timer::sleep(dur).await;
+            let ex0_ru_finish = getrusage();
+
+            assert!(
+                ex0_ru_finish - ex0_ru_start < Duration::from_millis(10),
+                "expected user time on LE0 is less than 10 millisecond"
+            );
+        });
 
         let ex = LocalExecutorBuilder::new(Placement::Fixed(0))
             .spin_before_park(Duration::from_millis(100))
             .make()
             .unwrap();
-        let ex_ru_start = getrusage_utime();
-        ex.run(async {
-            crate::spawn_local(async move { timer::sleep(dur).await }).await;
-        });
-        let ex_ru_finish = getrusage_utime();
 
-        assert!(
-            ex0_ru_finish - ex0_ru_start < Duration::from_millis(10),
-            "expected user time on LE0 is less than 10 millisecond"
-        );
-        // 100 ms may have passed without us running for 100ms in case
-        // there are other threads. Need to be a bit more relaxed
-        assert!(
-            ex_ru_finish - ex_ru_start >= Duration::from_millis(50),
-            "expected user time on LE is much greater than 50 millisecond"
-        );
+        ex.run(async {
+            let ex_ru_start = getrusage();
+            timer::sleep(dur).await;
+            let ex_ru_finish = getrusage();
+
+            // 100 ms may have passed without us running for 100ms in case
+            // there are other threads. Need to be a bit more relaxed
+            assert!(
+                ex_ru_finish - ex_ru_start >= Duration::from_millis(50),
+                "expected user time on LE is much greater than 50 millisecond",
+            );
+        });
     }
 
     #[test]
@@ -3967,5 +4166,32 @@ mod test {
             .unwrap()
             .join();
         assert!(ret.is_err());
+    }
+
+    #[test]
+    fn local_executor_unset() {
+        LocalExecutor::default().run(async {});
+
+        #[cfg(not(feature = "native-tls"))]
+        assert!(!LOCAL_EX.is_set());
+
+        #[cfg(feature = "native-tls")]
+        assert!(unsafe { LOCAL_EX.is_null() });
+    }
+
+    #[test]
+    fn local_executor_unset_when_panic() {
+        let res = std::panic::catch_unwind(|| {
+            LocalExecutor::default().run(async {
+                panic!("uh oh!");
+            });
+        });
+        assert!(res.is_err());
+
+        #[cfg(not(feature = "native-tls"))]
+        assert!(!LOCAL_EX.is_set());
+
+        #[cfg(feature = "native-tls")]
+        assert!(unsafe { LOCAL_EX.is_null() });
     }
 }

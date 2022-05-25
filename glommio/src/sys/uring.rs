@@ -13,8 +13,10 @@ use rlimit::Resource;
 use std::{
     cell::{Cell, Ref, RefCell, RefMut},
     collections::VecDeque,
+    convert::TryFrom,
     ffi::CStr,
     fmt,
+    future::Future,
     io,
     ops::Range,
     os::unix::io::RawFd,
@@ -660,6 +662,7 @@ pub(crate) trait UringCommon {
     fn submission_queue(&mut self) -> ReactorQueue;
     fn submit_sqes(&mut self) -> io::Result<usize>;
     fn waiting_kernel_submission(&self) -> usize;
+    fn in_kernel(&self) -> usize;
     fn waiting_kernel_collection(&self) -> usize;
     fn needs_kernel_enter(&self) -> bool;
     fn can_sleep(&self) -> bool;
@@ -773,12 +776,11 @@ struct PollRing {
     ring: iou::IoUring,
     size: usize,
     submission_queue: ReactorQueue,
-    submitted: u64,
-    completed: u64,
     allocator: Rc<UringBufferAllocator>,
     stats: RingIoStats,
     task_queue_stats: AHashMap<TaskQueueHandle, RingIoStats>,
     source_map: Rc<RefCell<SourceMap>>,
+    in_kernel: usize,
 }
 
 impl PollRing {
@@ -793,8 +795,6 @@ impl PollRing {
             iou::SetupFeatures::empty(),
         )?;
         Ok(PollRing {
-            submitted: 0,
-            completed: 0,
             size,
             ring,
             submission_queue: UringQueueState::with_capacity(size * 4),
@@ -802,6 +802,7 @@ impl PollRing {
             stats: RingIoStats::default(),
             task_queue_stats: AHashMap::new(),
             source_map,
+            in_kernel: 0,
         })
     }
 
@@ -831,7 +832,7 @@ impl UringCommon for PollRing {
         // We need to enter the kernel to submit and collect CQEs so if the number of
         // submitted requests doesn't match the number of request we collected, we need
         // to poll.
-        self.submitted != self.completed
+        self.in_kernel > 0 || self.waiting_kernel_submission() > 0
     }
 
     fn can_sleep(&self) -> bool {
@@ -840,6 +841,10 @@ impl UringCommon for PollRing {
 
     fn waiting_kernel_submission(&self) -> usize {
         self.ring.sq().ready() as usize
+    }
+
+    fn in_kernel(&self) -> usize {
+        self.in_kernel
     }
 
     fn waiting_kernel_collection(&self) -> usize {
@@ -851,12 +856,9 @@ impl UringCommon for PollRing {
     }
 
     fn submit_sqes(&mut self) -> io::Result<usize> {
-        if self.submitted != self.completed {
-            let res = self.ring.submit_sqes()?;
-            Ok(res as usize)
-        } else {
-            Ok(0)
-        }
+        let x = self.ring.submit_sqes()? as usize;
+        self.in_kernel += x;
+        Ok(x)
     }
 
     fn consume_one_event(&mut self) -> Option<bool> {
@@ -871,7 +873,7 @@ impl UringCommon for PollRing {
             source_map,
         )
         .map(|x| {
-            self.completed += 1;
+            self.in_kernel -= 1;
             x
         })
     }
@@ -888,7 +890,6 @@ impl UringCommon for PollRing {
                     continue;
                 }
 
-                self.submitted += ops.len() as u64;
                 for (op, mut sqe) in ops.into_iter().zip(sqes.into_iter()) {
                     let allocator = self.allocator.clone();
                     fill_sqe(
@@ -916,6 +917,7 @@ struct SleepableRing {
     stats: RingIoStats,
     task_queue_stats: AHashMap<TaskQueueHandle, RingIoStats>,
     source_map: Rc<RefCell<SourceMap>>,
+    in_kernel: usize,
 }
 
 impl SleepableRing {
@@ -935,6 +937,7 @@ impl SleepableRing {
             stats: RingIoStats::default(),
             task_queue_stats: AHashMap::new(),
             source_map,
+            in_kernel: 0,
         })
     }
 
@@ -950,7 +953,7 @@ impl SleepableRing {
         let source = Source::new(
             IoRequirements::default(),
             -1,
-            SourceType::Timeout(TimeSpec64::from(d), 0),
+            SourceType::Timeout(TimeSpec64::try_from(d).unwrap(), 0),
             None,
             None,
         );
@@ -986,7 +989,7 @@ impl SleepableRing {
         let timer_source = Source::new(
             IoRequirements::default(),
             -1,
-            SourceType::Timeout(TimeSpec64::from(Duration::MAX), min_events),
+            SourceType::Timeout(TimeSpec64::MAX, min_events),
             None,
             None,
         );
@@ -1166,6 +1169,10 @@ impl UringCommon for SleepableRing {
         self.ring.sq().ready() as usize
     }
 
+    fn in_kernel(&self) -> usize {
+        self.in_kernel
+    }
+
     fn waiting_kernel_collection(&self) -> usize {
         self.ring.cq().ready() as usize
     }
@@ -1176,6 +1183,7 @@ impl UringCommon for SleepableRing {
 
     fn submit_sqes(&mut self) -> io::Result<usize> {
         let x = self.ring.submit_sqes()? as usize;
+        self.in_kernel += x;
         Ok(x)
     }
 
@@ -1196,6 +1204,10 @@ impl UringCommon for SleepableRing {
             },
             source_map,
         )
+        .map(|x| {
+            self.in_kernel -= 1;
+            x
+        })
     }
 
     fn submit_one_event(&mut self, queue: &mut VecDeque<UringDescriptor>) -> Option<bool> {
@@ -1579,52 +1591,62 @@ impl Reactor {
         );
     }
 
-    fn enqueue_blocking_request(&self, source: &Source, op: BlockingThreadOp) {
-        self.blocking_thread
-            .push(op, source.inner.clone())
-            .expect("failed to spawn blocking request");
+    fn enqueue_blocking_request(
+        &self,
+        source: Pin<Rc<RefCell<InnerSource>>>,
+        op: BlockingThreadOp,
+    ) -> impl Future<Output = ()> {
+        self.blocking_thread.push(op, source)
     }
 
-    pub(crate) fn truncate(&self, source: &Source, size: u64) {
+    pub(crate) fn truncate(&self, source: &Source, size: u64) -> impl Future<Output = ()> {
         let op = BlockingThreadOp::Truncate(source.raw(), size as _);
-        self.enqueue_blocking_request(source, op);
+        self.enqueue_blocking_request(source.inner.clone(), op)
     }
 
-    pub(crate) fn rename(&self, source: &Source) {
+    pub(crate) fn rename(&self, source: &Source) -> impl Future<Output = ()> {
         let (old_path, new_path) = match &*source.source_type() {
             SourceType::Rename(o, n) => (o.clone(), n.clone()),
             _ => panic!("Unexpected source for rename operation"),
         };
 
         let op = BlockingThreadOp::Rename(old_path, new_path);
-        self.enqueue_blocking_request(source, op);
+        self.enqueue_blocking_request(source.inner.clone(), op)
     }
 
-    pub(crate) fn create_dir(&self, source: &Source, mode: libc::c_int) {
+    pub(crate) fn create_dir(
+        &self,
+        source: &Source,
+        mode: libc::c_int,
+    ) -> impl Future<Output = ()> {
         let path = match &*source.source_type() {
             SourceType::CreateDir(p) => p.clone(),
             _ => panic!("Unexpected source for rename operation"),
         };
 
         let op = BlockingThreadOp::CreateDir(path, mode);
-        self.enqueue_blocking_request(source, op);
+        self.enqueue_blocking_request(source.inner.clone(), op)
     }
 
-    pub(crate) fn remove_file(&self, source: &Source) {
+    pub(crate) fn remove_file(&self, source: &Source) -> impl Future<Output = ()> {
         let path = match &*source.source_type() {
             SourceType::Remove(path) => path.clone(),
             _ => panic!("Unexpected source for remove operation"),
         };
 
         let op = BlockingThreadOp::Remove(path);
-        self.enqueue_blocking_request(source, op);
+        self.enqueue_blocking_request(source.inner.clone(), op)
     }
 
-    pub(crate) fn run_blocking(&self, source: &Source, f: Box<dyn FnOnce() + Send + 'static>) {
+    pub(crate) fn run_blocking(
+        &self,
+        source: &Source,
+        f: Box<dyn FnOnce() + Send + 'static>,
+    ) -> impl Future<Output = ()> {
         assert!(matches!(&*source.source_type(), SourceType::BlockingFn));
 
         let op = BlockingThreadOp::Fn(f);
-        self.enqueue_blocking_request(source, op);
+        self.enqueue_blocking_request(source.inner.clone(), op)
     }
 
     pub(crate) fn close(&self, source: &Source) {
@@ -1856,7 +1878,7 @@ impl Reactor {
             // From this moment on the remote executors are aware that we are sleeping
             // We have to sweep the remote channels function once more because since
             // last time until now it could be that something happened in a remote executor
-            // that opened up room. If if did we bail on sleep and go process it.
+            // that opened up room. If it did we bail on sleep and go process it.
             self.notifier.prepare_to_sleep();
             // See https://www.scylladb.com/2018/02/15/memory-barriers-seastar-linux/ for
             // details. This translates to `sys_membarrier()` /
@@ -1880,7 +1902,7 @@ impl Reactor {
         if let Some(preempt) = preempt_timer() {
             self.latency_preemption_timeout_src
                 .set(Some(lat_ring.prepare_latency_preemption_timer(preempt)));
-            assert!(flush_rings!(lat_ring, main_ring)? > 0);
+            flush_rings!(lat_ring, main_ring)?;
         }
 
         // A Note about `need_preempt`:
@@ -2041,7 +2063,10 @@ mod tests {
             let source = Source::new(
                 IoRequirements::default(),
                 -1,
-                SourceType::Timeout(TimeSpec64::from(Duration::from_millis(millis)), 0),
+                SourceType::Timeout(
+                    TimeSpec64::try_from(Duration::from_millis(millis)).unwrap(),
+                    0,
+                ),
                 None,
                 None,
             );

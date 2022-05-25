@@ -287,6 +287,8 @@
 //! ```
 #![warn(missing_docs, missing_debug_implementations, rust_2018_idioms)]
 #![cfg_attr(doc, deny(rustdoc::broken_intra_doc_links))]
+#![cfg_attr(feature = "native-tls", feature(thread_local))]
+
 #[macro_use]
 extern crate nix;
 extern crate alloc;
@@ -819,6 +821,33 @@ pub(crate) mod test_utils {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    pub(crate) fn make_test_directories(test_name: &str) -> std::vec::Vec<TestDirectory> {
+        let mut vec = Vec::new();
+
+        // Glommio currently only supports NVMe-backed volumes formatted with XFS or
+        // EXT4. We therefore let the user decide what directory glommio should
+        // use to host the unit tests in. For more information regarding this
+        // limitation, see the README
+        match std::env::var("GLOMMIO_TEST_POLLIO_ROOTDIR") {
+            Err(_) => {
+                eprintln!(
+                    "Glommio currently only supports NVMe-backed volumes formatted with XFS or \
+                     EXT4. To run poll io-related tests, please set GLOMMIO_TEST_POLLIO_ROOTDIR \
+                     to a NVMe-backed directory path in your environment.\nPoll io tests will not \
+                     run."
+                );
+            }
+            Ok(path) => {
+                for p in path.split(',') {
+                    vec.push(make_poll_test_directory(p, test_name));
+                }
+            }
+        };
+
+        vec.push(make_tmp_test_directory(test_name));
+        vec
     }
 
     pub(crate) fn make_poll_test_directory<P: AsRef<Path>>(

@@ -81,8 +81,8 @@ impl TryFrom<SourceType> for libc::statx {
     fn try_from(value: SourceType) -> Result<Self, Self::Error> {
         match value {
             SourceType::Statx(_, buf) => Ok(buf.into_inner()),
-            _ => Err(GlommioError::ReactorError(
-                ReactorErrorKind::IncorrectSourceType,
+            src => Err(GlommioError::ReactorError(
+                ReactorErrorKind::IncorrectSourceType(format!("{:?}", src)),
             )),
         }
     }
@@ -190,7 +190,9 @@ impl Source {
         let mut inner = self.inner.borrow_mut();
         let t = &mut inner.timeout;
         let old = *t;
-        *t = Some(TimeSpec64::from(d));
+        match TimeSpec64::try_from(d) {
+            Ok(dur) | Err(dur) => *t = Some(dur),
+        }
         old.map(Duration::from)
     }
 

@@ -57,10 +57,10 @@ pub enum QueueErrorKind {
 }
 
 /// Errors coming from the reactor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReactorErrorKind {
     /// Indicates an incorrect source type.
-    IncorrectSourceType,
+    IncorrectSourceType(String),
 
     /// Reactor unable to lock memory (max allowed, min required)
     MemLockLimit(u64, u64),
@@ -69,7 +69,9 @@ pub enum ReactorErrorKind {
 impl fmt::Display for ReactorErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ReactorErrorKind::IncorrectSourceType => write!(f, "Incorrect source type!"),
+            ReactorErrorKind::IncorrectSourceType(x) => {
+                write!(f, "Incorrect source type: {:?}!", x)
+            }
             ReactorErrorKind::MemLockLimit(max, min) => write!(
                 f,
                 "The memlock resource limit is too low: {} (recommended {})",
@@ -218,6 +220,10 @@ pub enum GlommioError<T> {
     /// variant needs to return the actual item sent into the channel.
     Closed(ResourceType<T>),
 
+    /// The resource can not be closed because certain conditions are not
+    /// satisfied
+    CanNotBeClosed(ResourceType<T>, &'static str),
+
     /// Error encapsulating the `WouldBlock` error for types that don't have
     /// errors originating in the standard library. Glommio also has
     /// nonblocking types that need to indicate if they are blocking or not.
@@ -254,7 +260,7 @@ impl<T> fmt::Display for GlommioError<T> {
                 source, op, path, fd
             ),
             GlommioError::ExecutorError(err) => write!(f, "Executor error: {}", err),
-            GlommioError::BuilderError(err) => write!(f, "Executror builder error: {}", err),
+            GlommioError::BuilderError(err) => write!(f, "Executor builder error: {}", err),
             GlommioError::Closed(rt) => match rt {
                 ResourceType::Semaphore {
                     requested,
@@ -270,6 +276,11 @@ impl<T> fmt::Display for GlommioError<T> {
                 ResourceType::File(msg) => write!(f, "File is closed ({})", msg),
                 ResourceType::Gate => write!(f, "Gate is closed"),
             },
+            GlommioError::CanNotBeClosed(_, s) => write!(
+                f,
+                "Can not be closed because certain conditions are not satisfied. {}",
+                *s
+            ),
             GlommioError::WouldBlock(rt) => match rt {
                 ResourceType::Semaphore {
                     requested,
@@ -404,6 +415,22 @@ impl<T> Debug for GlommioError<T> {
                 ResourceType::File(msg) => write!(f, "File is closed (\"{}\")", msg),
                 ResourceType::Gate => write!(f, "Gate is closed"),
             },
+            GlommioError::CanNotBeClosed(resource, str) => match resource {
+                ResourceType::RwLock => write!(f, "RwLock can not be closed (\"{}\")", *str),
+                ResourceType::Channel(_) => write!(f, "Channel can not be closed (\"{}\")", *str),
+                ResourceType::File(msg) => {
+                    write!(f, "File can not be closed : (\"{}\"). (\"{}\")", *str, msg)
+                }
+                ResourceType::Gate => write!(f, "Gate can not be closed: {}", *str),
+                ResourceType::Semaphore {
+                    requested,
+                    available,
+                } => write!(
+                    f,
+                    "Semaphore can not be closed: {}. {{ requested {}, available: {} }}",
+                    *str, requested, available
+                ),
+            },
             GlommioError::WouldBlock(resource) => match resource {
                 ResourceType::Semaphore {
                     requested,
@@ -454,13 +481,14 @@ impl<T> Debug for GlommioError<T> {
                 "EnhancedIoError {{ source: {:?}, op: {:?}, path: {:?}, fd: {:?} }}",
                 source, op, path, fd
             ),
-            GlommioError::ReactorError(kind) => {
-                let kind = match kind {
-                    ReactorErrorKind::IncorrectSourceType => "IncorrectSourceType",
-                    ReactorErrorKind::MemLockLimit(_, _) => "MemLockLimit",
-                };
-                write!(f, "ReactorError {{ kind: '{}' }}", kind)
-            }
+            GlommioError::ReactorError(kind) => match kind {
+                ReactorErrorKind::IncorrectSourceType(x) => {
+                    write!(f, "ReactorError {{ kind: IncorrectSourceType {:?} }}", x)
+                }
+                ReactorErrorKind::MemLockLimit(a, b) => {
+                    write!(f, "ReactorError {{ kind: MemLockLimit({:?}/{:?}) }}", a, b)
+                }
+            },
             GlommioError::TimedOut(dur) => write!(f, "TimedOut {{ dur {:?} }}", dur),
         }
     }
@@ -473,6 +501,9 @@ impl<T> From<GlommioError<T>> for io::Error {
             GlommioError::IoError(io_err) => io_err,
             GlommioError::WouldBlock(_) => io::Error::new(io::ErrorKind::WouldBlock, display_err),
             GlommioError::Closed(_) => io::Error::new(io::ErrorKind::BrokenPipe, display_err),
+            GlommioError::CanNotBeClosed(_, _) => {
+                io::Error::new(io::ErrorKind::BrokenPipe, display_err)
+            }
             GlommioError::ExecutorError(ExecutorErrorKind::QueueError { index, kind }) => {
                 match kind {
                     QueueErrorKind::StillActive => io::Error::new(
@@ -499,9 +530,16 @@ impl<T> From<GlommioError<T>> for io::Error {
             GlommioError::EnhancedIoError { source, .. } => {
                 io::Error::new(source.kind(), display_err)
             }
-            GlommioError::ReactorError(_) => {
-                io::Error::new(io::ErrorKind::InvalidData, "Incorrect source type!")
-            }
+            GlommioError::ReactorError(e) => match e {
+                ReactorErrorKind::IncorrectSourceType(x) => io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("IncorrectSourceType {:?}", x),
+                ),
+                ReactorErrorKind::MemLockLimit(a, b) => io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("MemLockLimit({:?}/{:?})", a, b),
+                ),
+            },
             GlommioError::TimedOut(dur) => io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!("timed out after {:#?}", dur),
@@ -512,8 +550,9 @@ impl<T> From<GlommioError<T>> for io::Error {
 
 #[cfg(test)]
 mod test {
-    use super::*;
     use std::{io, panic::panic_any};
+
+    use super::*;
 
     #[test]
     #[should_panic(
