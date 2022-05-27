@@ -165,6 +165,7 @@ pub use self::{
         BulkIo,
         IoConcurrencyLimiter,
         IoVec,
+        ReadManyArgs,
         MergedBufferLimit,
         OrderedBulkIo,
         ReadAmplificationLimit,
