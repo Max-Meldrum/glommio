@@ -194,7 +194,7 @@ impl BufferedFile {
     /// pre-allocates space in the filesystem to hold a file at least as big as
     /// the size argument.
     pub async fn pre_allocate(&self, size: u64) -> Result<()> {
-        self.file.pre_allocate(size).await.map_err(Into::into)
+        self.file.fallocate(0, size).await.map_err(Into::into)
     }
 
     /// Truncates a file to the specified size.
